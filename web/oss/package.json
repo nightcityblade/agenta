@@ -13,6 +13,7 @@
         "start": "next start",
         "lint": "next lint",
         "lint-fix": "next lint --fix",
+        "test:unit": "vitest run --config vitest.config.ts",
         "format": "prettier --check .",
         "format-fix": "prettier --write .",
         "types:check": "tsc",
@@ -143,6 +144,7 @@
         "fflate": "0.4.8",
         "node-mocks-http": "^1.17.2",
         "prettier": "^3.7.4",
-        "tailwind-scrollbar": "^3"
+        "tailwind-scrollbar": "^3",
+        "vitest": "^4.1.4"
     }
 }

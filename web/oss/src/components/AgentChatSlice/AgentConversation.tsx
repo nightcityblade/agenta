@@ -48,7 +48,7 @@ import {
     UploadSimple,
 } from "@phosphor-icons/react"
 import {useQueryClient} from "@tanstack/react-query"
-import {type UIMessage} from "ai"
+import {type FileUIPart, type UIMessage} from "ai"
 import {App, Button, Modal, Tag, Tooltip} from "antd"
 import type {UploadFile} from "antd"
 import {useAtom, useAtomValue, useSetAtom, useStore} from "jotai"
@@ -90,17 +90,19 @@ import {playgroundInspectorEnabledAtom} from "@/oss/state/settings/featureFlags"
 
 import {AgentChatTransport} from "./assets/AgentChatTransport"
 import {
+    attachmentLimitsForModalities,
     type AttachmentRejection,
-    DEFAULT_ATTACHMENT_LIMITS,
     describeAccepted,
     validateIncoming,
 } from "./assets/attachments"
+import {uploadAttachment, type SessionAttachmentResponse} from "./assets/attachmentTransport"
 import {
     doesAgentChatStopKillSession,
     isAgentFileUploadsEnabled,
     isAgentVoiceInputEnabled,
 } from "./assets/constants"
-import {filesToParts} from "./assets/files"
+import {attachmentNamesByMessage, filesToInlineParts, filesToParts} from "./assets/files"
+import {runWithInFlightSubmit} from "./assets/inFlightSubmit"
 import {loadSessionMessages} from "./assets/loadSession"
 import {messageText, sideEffectingToolsInRange} from "./assets/rewind"
 import {SESSION_SPRING} from "./assets/sessionMotion"
@@ -131,7 +133,7 @@ import RightPanelSplit from "./components/RightPanel/RightPanelSplit"
 import VoiceInputButton from "./components/VoiceInputButton"
 import {useAgentChatQueue, type QueuedMessage} from "./hooks/useAgentChatQueue"
 import {useAgentModelKeyStatus} from "./hooks/useAgentModelKeyStatus"
-import {useAttachmentUploads} from "./hooks/useAttachmentUploads"
+import {removeUploadFile, useAttachmentUploads} from "./hooks/useAttachmentUploads"
 import {useAudioRecorder} from "./hooks/useAudioRecorder"
 import {useFileActivityDetector} from "./hooks/useFileActivityDetector"
 import {expandedKeysForMessages, pruneExpandedAtom} from "./state/expandState"
@@ -210,11 +212,13 @@ const CONTENT_VISIBILITY_ENABLED = false as boolean
  *  - DT5 a11y: the message log is an aria-live region; controls are keyboard-operable.
  */
 
-/** A part the transcript actually renders — non-empty text/reasoning, files, sources, tools. */
+/** A part the transcript renders: non-empty prose, files, non-native delivery notices, sources, or tools. */
 const isVisiblePart = (p: UIMessage["parts"][number]): boolean =>
     (p.type === "text" && Boolean((p as {text?: string}).text?.trim())) ||
     (p.type === "reasoning" && Boolean((p as {text?: string}).text?.trim())) ||
     p.type === "file" ||
+    (p.type === "data-attachment-delivery" &&
+        (p as {data?: {outcome?: string}}).data?.outcome !== "native") ||
     p.type === "source-url" ||
     p.type.startsWith("tool-") ||
     p.type === "dynamic-tool"
@@ -438,7 +442,7 @@ const AgentConversation = ({
 
     // Restored from the per-session store on remount (route re-entry, tab close/reopen) —
     // pending attachments survive alongside the composer draft. Rejections stay transient.
-    const [files, setFiles] = useState<UploadFile[]>(
+    const [files, setFiles] = useState<UploadFile<SessionAttachmentResponse>[]>(
         () => attachmentsBySession.get(sessionId) ?? [],
     )
     useEffect(() => {
@@ -450,9 +454,6 @@ const AgentConversation = ({
     // The attachment currently open in the Files-drawer preview (its uid), or null when closed.
     const [viewingUid, setViewingUid] = useState<string | null>(null)
     const [attachmentsOpen, setAttachmentsOpen] = useState(false)
-    // Single limits object so it can later be swapped for capability-derived limits.
-    const limits = DEFAULT_ATTACHMENT_LIMITS
-    const atMax = files.length >= limits.maxCount
     // Drag-over state for the whole-panel drop overlay (depth counter avoids child flicker).
     const dragDepthRef = useRef(0)
     const [isDragging, setIsDragging] = useState(false)
@@ -815,15 +816,16 @@ const AgentConversation = ({
     // component and its logic stay wired up; flip this to `true` to bring the UI back.
     const showContextBudget = false
 
-    /**
-     * Whether the selected model can actually take audio in. `null` means the catalog does not
-     * say — treated as unknown, never as "no", so a missing field can't quietly demote voice.
-     * Drives which voice mode leads; it never refuses an attachment (design decision D6).
-     */
-    const audioPerceivable = useMemo(() => {
-        const modalities = modalitiesForModel(harnessCapabilities, modelKey.harness, modelKey.model)
-        return modalities ? modalities.includes("audio") : null
-    }, [harnessCapabilities, modelKey.harness, modelKey.model])
+    const modelModalities = useMemo(
+        () => modalitiesForModel(harnessCapabilities, modelKey.harness, modelKey.model),
+        [harnessCapabilities, modelKey.harness, modelKey.model],
+    )
+    const limits = useMemo(() => attachmentLimitsForModalities(modelModalities), [modelModalities])
+    const atMax = files.length >= limits.maxCount
+
+    // The same model-derived perception drives voice defaults and chip notices; unknown stays
+    // workspace-only everywhere, matching the runner's rule.
+    const audioPerceivable = limits.perceived.audio
 
     // ── Playground-native onboarding ──────────────────────────────────────────
     // This chat panel IS the onboarding surface while the agent is ephemeral: the empty state shows the
@@ -1732,28 +1734,61 @@ const AgentConversation = ({
         [],
     )
 
-    const toUploadFile = (file: File): UploadFile => ({
-        uid: `${file.name}-${file.lastModified}-${file.size}`,
+    // Flagged off until the agent service accepts audio parts (`NEXT_PUBLIC_AGENT_VOICE_INPUT`).
+    const voiceEnabled = isAgentVoiceInputEnabled()
+    // Every attach path is gated until the agent service can deliver reference file parts.
+    const uploadsEnabled = isAgentFileUploadsEnabled()
+
+    const toUploadFile = (file: File): UploadFile<SessionAttachmentResponse> => ({
+        // The uid doubles as the upload idempotency key, so retry reuses the original identity.
+        uid: generateId(),
         name: file.name,
-        status: "done",
+        status: uploadsEnabled ? "uploading" : "done",
+        percent: uploadsEnabled ? 0 : 100,
         originFileObj: file as UploadFile["originFileObj"],
     })
 
-    // Upload lifecycle for the tray (progress / error / retry). The transport is not wired yet, so
-    // no uploader is passed — files stay "done" and enqueue is a no-op. When upload lands, provide
-    // an uploader here and the whole flow runs; the tray already renders every state.
-    const uploads = useAttachmentUploads(files, setFiles, undefined)
-    // A staged attachment blocks send only once uploads exist: while any is uploading or has failed,
-    // the message isn't ready. All-"done" today, so this is inert until the transport is wired.
-    const attachmentsSettled = !files.some((f) => f.status === "uploading" || f.status === "error")
+    const attachmentUploader = useCallback(
+        (
+            file: File,
+            {
+                uid,
+                onProgress,
+                signal,
+            }: {
+                uid: string
+                onProgress: (percent: number) => void
+                signal: AbortSignal
+            },
+        ) =>
+            uploadAttachment({
+                file,
+                sessionId,
+                idempotencyKey: uid,
+                onProgress,
+                signal,
+            }),
+        [sessionId],
+    )
+    const uploads = useAttachmentUploads(files, setFiles, attachmentUploader)
+    const attachmentsSettled = uploadsEnabled
+        ? files.every((file) => file.status === "done" && Boolean(file.response?.attachment))
+        : files.every((file) => file.status === "done")
+
+    const uploadBlockReason = files.some((file) => file.status === "error")
+        ? "an upload failed"
+        : files.some((file) => file.status === "uploading")
+          ? "waiting for uploads"
+          : undefined
 
     /** Add files from paste / programmatic sources through the guardrails. */
     const addFiles = (incoming: File[], extraRejections: AttachmentRejection[] = []) => {
         const {accepted, rejections} = validateIncoming(incoming, files.length, limits)
         const allRejections = [...extraRejections, ...rejections]
         if (accepted.length) {
-            setFiles((prev) => [...prev, ...accepted.map(toUploadFile)])
-            uploads.enqueue(accepted.map((f) => `${f.name}-${f.lastModified}-${f.size}`))
+            const entries = accepted.map(toUploadFile)
+            setFiles((prev) => [...prev, ...entries])
+            if (uploadsEnabled) uploads.enqueue(entries.map((entry) => entry.uid))
         }
         setRejections(allRejections)
         // Open for rejections too. Otherwise dropping something unsupported writes a message into
@@ -1761,7 +1796,7 @@ const AgentConversation = ({
         if (accepted.length || allRejections.length) setAttachmentsOpen(true)
     }
 
-    const removeFile = (uid: string) => setFiles((prev) => prev.filter((f) => f.uid !== uid))
+    const removeFile = (uid: string) => removeUploadFile(uid, uploads.abort, setFiles)
 
     // Voice-message recording: the clip lands in the attachment tray like any file. Owned here so
     // the recording takeover (RecordingBar) can cover the whole composer while capturing.
@@ -1773,11 +1808,6 @@ const AgentConversation = ({
      * Decided when recording STARTS: the composer is covered by the recording bar and drops are
      * blocked while capturing, so neither the text nor the tray can change in between.
      */
-    // Flagged off until the agent service accepts audio parts (`NEXT_PUBLIC_AGENT_VOICE_INPUT`).
-    const voiceEnabled = isAgentVoiceInputEnabled()
-    // Every attach path — button, preview, drive uploads, paste, drag-and-drop — is gated on
-    // `NEXT_PUBLIC_AGENT_FILE_UPLOADS` until the agent service can deliver file parts.
-    const uploadsEnabled = isAgentFileUploadsEnabled()
     const [voiceWillSend, setVoiceWillSend] = useState(false)
     const voiceRecorder = useAudioRecorder((file) => {
         if (voiceWillSend) handleSubmit("", [file])
@@ -1846,9 +1876,9 @@ const AgentConversation = ({
         setIsDragging(false)
         if (attachmentsBlocked()) return
 
-        // A dropped folder still arrives in `files` — as a typeless, zero-byte entry that the
+        // A dropped folder still arrives in `files` as a typeless, zero-byte entry that the
         // guardrails would reject as "not a supported file type", which is misleading. Name it.
-        // `webkitGetAsEntry` is only valid synchronously, during this event.
+        // `webkitGetAsEntry` is only valid synchronously during this event.
         const folderNames = Array.from(e.dataTransfer.items ?? [])
             .map((item) => (item.kind === "file" ? item.webkitGetAsEntry() : null))
             .filter((entry): entry is FileSystemEntry => !!entry?.isDirectory)
@@ -1865,20 +1895,10 @@ const AgentConversation = ({
         if (dropped.length || folderRejections.length) addFiles(dropped, folderRejections)
     }
 
-    const handleSubmit = async (text: string, extraFiles: File[] = []) => {
-        const trimmed = text.trim()
-        const fileObjs = [
-            ...files
-                .map((f) => f.originFileObj as File | undefined)
-                .filter((f): f is File => Boolean(f)),
-            ...extraFiles,
-        ]
-        if (!trimmed && fileObjs.length === 0) return
-        if (!attachmentsSettled) return
-        const fileParts = fileObjs.length ? await filesToParts(fileObjs) : undefined
+    const finishSubmit = (trimmed: string, fileParts?: FileUIPart[]) => {
         // Glide to the bottom; the min-h-full active turn makes that show the new question at the top
         // with the answer streaming below. Park during the glide, follow again on settle. Clear any
-        // prior "stopped" marker — it's resolved by asking again.
+        // prior "stopped" marker because it is resolved by asking again.
         stickRef.current = false
         armBottomRef.current = true
         animateBottomRef.current = true
@@ -1886,7 +1906,7 @@ const AgentConversation = ({
         setStopped(false)
         // One path: `submit` sends now or queues behind held messages via the shared release gate.
         submit({text: trimmed, fileParts})
-        // The message left the composer — drop its persisted draft (and any pending capture).
+        // The message left the composer, so drop its persisted draft and pending capture.
         window.clearTimeout(draftTimerRef.current)
         composerDraftBySession.delete(sessionId)
         // Sending consumes the template provenance along with the composer text.
@@ -1895,6 +1915,69 @@ const AgentConversation = ({
         setRejections([])
         setAttachmentsOpen(false)
     }
+
+    const inFlightSubmitRef = useRef(false)
+    const handleSubmit = (text: string, extraFiles: File[] = []) =>
+        runWithInFlightSubmit(inFlightSubmitRef, async () => {
+            const trimmed = text.trim()
+            if (!trimmed && files.length === 0 && extraFiles.length === 0) return
+            if (!attachmentsSettled) return
+
+            if (!uploadsEnabled) {
+                // Voice and upload flags are independent; this seam preserves the inline recorder path.
+                const inlineFiles = [
+                    ...files
+                        .map((file) => file.originFileObj as File | undefined)
+                        .filter((file): file is File => Boolean(file)),
+                    ...extraFiles,
+                ]
+                const fileParts = inlineFiles.length
+                    ? await filesToInlineParts(inlineFiles)
+                    : undefined
+                finishSubmit(trimmed, fileParts)
+                return
+            }
+
+            const extraEntries = extraFiles.map(toUploadFile)
+            const extraResults = await Promise.allSettled(
+                extraEntries.map(async (entry) => {
+                    const file = entry.originFileObj as File
+                    const response = await attachmentUploader(file, {
+                        uid: entry.uid,
+                        onProgress: () => undefined,
+                        signal: new AbortController().signal,
+                    })
+                    return {...entry, status: "done" as const, percent: 100, response}
+                }),
+            )
+            if (extraResults.some((result) => result.status === "rejected")) {
+                const failedEntries = extraResults.map((result, index) =>
+                    result.status === "fulfilled"
+                        ? result.value
+                        : {
+                              ...extraEntries[index],
+                              status: "error" as const,
+                              error:
+                                  result.reason instanceof Error
+                                      ? result.reason.message
+                                      : "Upload failed",
+                          },
+                )
+                setFiles((prev) => [...prev, ...failedEntries])
+                setAttachmentsOpen(true)
+                return
+            }
+
+            const uploadedExtras = extraResults.map(
+                (result) =>
+                    (result as PromiseFulfilledResult<UploadFile<SessionAttachmentResponse>>).value,
+            )
+            const outboundFiles = [...files, ...uploadedExtras]
+            const fileParts = outboundFiles.length
+                ? filesToParts(outboundFiles, sessionId)
+                : undefined
+            finishSubmit(trimmed, fileParts)
+        })
 
     // First-run auto-start: a freshly-created agent lands with a seeded prompt, but its model is often
     // gated (no provider key yet). Connecting the key IS the go-ahead — so once the gate clears we send
@@ -2006,6 +2089,7 @@ const AgentConversation = ({
     // question can sit at the top). Derived from layout, NOT from `busy` — so it persists when the turn
     // settles instead of being yanked away (which clamped the scroll and jumped the view).
     const reserveActive = activeStart > 0
+    const deliveryAttachmentNames = useMemo(() => attachmentNamesByMessage(messages), [messages])
 
     const renderMessage = (message: UIMessage, index: number) => {
         const isLast = index === messages.length - 1
@@ -2052,6 +2136,8 @@ const AgentConversation = ({
             >
                 <AgentMessage
                     message={message}
+                    sessionId={sessionId}
+                    attachmentNames={deliveryAttachmentNames.get(message.id)}
                     isStreaming={busy && isLast}
                     isLastMessage={isLast}
                     onRewind={handleRewind}
@@ -2296,6 +2382,7 @@ const AgentConversation = ({
                                                 <MessageRow mid="pending-first-turn" enter>
                                                     <AgentMessage
                                                         message={pendingFirstMessage}
+                                                        sessionId={sessionId}
                                                         isLastMessage
                                                         onRewind={handleRewind}
                                                         onClientToolOutput={handleClientToolOutput}
@@ -2511,6 +2598,8 @@ const AgentConversation = ({
                                             sendForceEnabled={
                                                 files.length > 0 && attachmentsSettled
                                             }
+                                            sendDisabled={files.length > 0 && !attachmentsSettled}
+                                            sendDisabledReason={uploadBlockReason}
                                             streaming={busy}
                                             onStop={handleStop}
                                             prefix={
@@ -2591,7 +2680,6 @@ const AgentConversation = ({
                                                         files={files}
                                                         rejections={rejections}
                                                         limits={limits}
-                                                        audioPerceivable={audioPerceivable}
                                                         onAdd={addFiles}
                                                         onRemove={removeFile}
                                                         onDismissRejections={() =>
@@ -2603,6 +2691,7 @@ const AgentConversation = ({
                                                                 : undefined
                                                         }
                                                         onRetry={uploads.retry}
+                                                        canRetry={uploads.canRetry}
                                                     />
                                                 </HeightCollapse>
                                             }
