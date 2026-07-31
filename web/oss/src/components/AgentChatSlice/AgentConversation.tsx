@@ -1775,8 +1775,8 @@ const AgentConversation = ({
      */
     // Flagged off until the agent service accepts audio parts (`NEXT_PUBLIC_AGENT_VOICE_INPUT`).
     const voiceEnabled = isAgentVoiceInputEnabled()
-    // Attach button + attachment preview + drive uploads (`NEXT_PUBLIC_AGENT_FILE_UPLOADS`). Paste
-    // and drag-to-attach predate the flag and stay on.
+    // Every attach path — button, preview, drive uploads, paste, drag-and-drop — is gated on
+    // `NEXT_PUBLIC_AGENT_FILE_UPLOADS` until the agent service can deliver file parts.
     const uploadsEnabled = isAgentFileUploadsEnabled()
     const [voiceWillSend, setVoiceWillSend] = useState(false)
     const voiceRecorder = useAudioRecorder((file) => {
@@ -1812,7 +1812,7 @@ const AgentConversation = ({
      * accepting files into an input you cannot send from is a dead end.
      */
     const composerDisabled = onboardingActive ? ideHandoffActive : modelBlocked
-    const attachmentsBlocked = () => voiceRecorder.active || composerDisabled
+    const attachmentsBlocked = () => !uploadsEnabled || voiceRecorder.active || composerDisabled
 
     // The panel is ALWAYS a drop target for file drags — preventDefault on enter/over/drop even when
     // blocked. Otherwise the browser's default action for a file drop is to navigate to it, which
@@ -2545,8 +2545,7 @@ const AgentConversation = ({
                                                         />
                                                     ) : null}
                                                     {/* Attach button stays dead until the agent service is ready
-                                                for inline file parts (`NEXT_PUBLIC_AGENT_FILE_UPLOADS`);
-                                                paste / drag-to-add still work either way. */}
+                                                for inline file parts (`NEXT_PUBLIC_AGENT_FILE_UPLOADS`). */}
                                                     <Tooltip
                                                         title={
                                                             !uploadsEnabled
